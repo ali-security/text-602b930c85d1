@@ -1,0 +1,92 @@
+name: seal-build
+
+# golang.org/x/text has no upstream GitHub Actions CI (the project is developed on
+# Gerrit and tested by the Go build dashboard), so this workflow is written for the
+# sealed build: it packs the module zip the proxy serves for the tag and runs the
+# module's own `go test ./...` suite.
+
+on:
+  workflow_dispatch:
+    inputs:
+      test-filter:
+        description: "Go package/test selector; empty runs the full suite"
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+env:
+  GOPROXY: https://proxy.golang.org,direct
+  GOFLAGS: -buildvcs=false
+
+jobs:
+  module-zip:
+    name: module zip
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.24"
+          cache: false
+
+      # Built in its own module outside the checkout so that neither the helper
+      # source nor its go.mod/go.sum can land in the module zip.
+      - name: Build the module-zip helper
+        run: |
+          set -eux
+          HELPER=$(mktemp -d)
+          cp "$GITHUB_WORKSPACE/.github/create_mod.go" "$HELPER/"
+          cd "$HELPER"
+          go mod init example.com/createmod
+          go get golang.org/x/mod@v0.24.0
+          go build -o "$RUNNER_TEMP/create_mod" .
+
+      - name: Pack golang.org/x/text@v0.34.0
+        run: |
+          set -eux
+          mkdir -p "$RUNNER_TEMP/out"
+          # This workflow is not part of the released module; drop it so the zip
+          # holds exactly the tagged tree.
+          rm -rf "$GITHUB_WORKSPACE/.github"
+          "$RUNNER_TEMP/create_mod" golang.org/x/text v0.34.0 "$GITHUB_WORKSPACE" "$RUNNER_TEMP/out/v0.34.0.zip"
+          unzip -l "$RUNNER_TEMP/out/v0.34.0.zip" | tail -5
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: module-zip
+          path: ${{ runner.temp }}/out/v0.34.0.zip
+          if-no-files-found: error
+
+  test:
+    name: test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-latest
+          - macos-latest
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.24"
+
+      - name: Build
+        run: |
+          set -eux
+          go build ./...
+
+      - name: Test
+        run: |
+          set -eux
+          go test ${{ inputs.test-filter || './...' }}
